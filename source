@@ -1,4 +1,4 @@
-// --- SCRIPT Ứng dụng hiệu chỉnh và phân tích ảnh ---
+// --- SCRIPT Ứng dụng Hiệu chỉnh và phân tích ảnh ---
 // Kết hợp Block 1 (UI & Drawing), Block 2 (Lọc ảnh), Block 3 (Tính toán & Hiển thị setup), Block 4 (Hiển thị Map & Kết quả Phân tích)
 
 // --- KHAI BÁO BIẾN TOÀN CẦU ---
