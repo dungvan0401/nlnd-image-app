@@ -1,4 +1,5 @@
-1.Ứng dụng có tên: NLND image app
+1.Ứng dụng có tên: NLND image app.
+
 Được tạo bởi: Trần Hồng Ngọc, Nguyễn Văn Dũng, Đinh Ngọc Lĩnh, Trần Giang Nam - Sinh viên lớp DCCTKH67B, khoa Công nghệ thông tin, trường Đại học Mỏ-Địa chất.
 
 2.Ứng dụng được tạo ra bản đầu tiên vào ngày 30/4/2025.
