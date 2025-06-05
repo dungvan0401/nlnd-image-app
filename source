@@ -1,0 +1,999 @@
+// --- SCRIPT Ứng dụng hiệu chỉnh và phân tích ảnh ---
+// Kết hợp Block 1 (UI & Drawing), Block 2 (Lọc ảnh), Block 3 (Tính toán & Hiển thị setup), Block 4 (Hiển thị Map & Kết quả Phân tích)
+
+// --- KHAI BÁO BIẾN TOÀN CẦU ---
+// Biến cho UI
+var controlPanel; // <-- Biến cho panel điều khiển chính bên trái
+var map; // <-- Biến cho đối tượng bản đồ
+var satelliteSelect; // <-- Biến cho dropdown chọn loại ảnh vệ tinh
+var indexSelect; // <-- Biến cho dropdown chọn chỉ số/tổ hợp băng tần
+var cloudSlider; // <-- Biến cho thanh trượt chọn mật độ mây tối đa
+var processButton; // <-- Biến cho nút xử lý và hiển thị kết quả
+var resultsPanel; // <-- Biến cho panel hiển thị kết quả phân tích thống kê
+var statusLabel; // <-- Biến cho label hiển thị trạng thái xử lý
+var legendPanel; // <-- Biến cho panel chú giải
+
+// Biến cho Drawing Tools
+var drawingTools; // <-- Biến cho công cụ vẽ trên bản đồ
+
+// Biến cho nút xóa tất cả
+var clearButton; // <-- Biến cho nút xóa tất cả các lớp và reset
+
+// Biến cho nút xuất dữ liệu và ảnh/geometry để xuất
+var exportButton; // <-- Biến cho nút xuất ảnh ra Google Drive
+var lastAnalysisImage = null; // Biến lưu trữ ảnh phân tích cuối cùng sẵn sàng để xuất
+var lastDrawnGeometry = null; // Biến lưu trữ hình học đã sử dụng để cắt (cho việc xuất)
+
+// Biến để lưu trữ các Textbox chọn ngày
+var startDateTextbox; // <-- Biến cho textbox nhập ngày bắt đầu
+var endDateTextbox; // <-- Biến cho textbox nhập ngày kết thúc
+
+var exportFilenameTextbox; // <-- Biến cho textbox nhập tên file xuất
+
+var pixelValueLabel; // <-- Biến cho label hiển thị giá trị tại điểm click
+
+// <-- ĐÃ THÊM/SỬA ĐỔI ĐỂ TÍCH HỢP CHỌN TỈNH -->
+// Biến cho ranh giới tỉnh và AOI
+var provinces; // FeatureCollection cho ranh giới tỉnh Việt Nam
+var aoi = null; // Biến lưu trữ Area of Interest (có thể là tỉnh hoặc vùng vẽ tay)
+// <-- KẾT THÚC THÊM/SỬA ĐỔI ĐỂ TÍCH HỢP CHỌN TỈNH -->
+
+// --- HÀM TRỢ GIÚP (Block 2, 3 & LEGEND) ---
+
+// Hàm xử lý Scaling Factor và đổi tên bands cho các loại vệ tinh khác nhau
+var prepSatelliteImage = function(image, satelliteType) {
+    var processedImage = image;
+
+    if (satelliteType === 'Landsat 8' || satelliteType === 'Landsat 9') {
+        // Áp dụng scaling factor và đổi tên băng tần cho Landsat
+        processedImage = image.select(
+            ['SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7'],
+            ['Blue', 'Green', 'Red', 'NIR', 'SWIR1', 'SWIR2']
+        ).multiply(0.0000275).add(-0.2);
+    } else if (satelliteType === 'Sentinel-2') {
+        // Áp dụng scaling factor và đổi tên băng tần cho Sentinel-2
+        processedImage = image.select(
+            ['B2', 'B3', 'B4', 'B8', 'B11', 'B12'],
+            ['Blue', 'Green', 'Red', 'NIR', 'SWIR1', 'SWIR2']
+        ).divide(10000);
+    } else if (satelliteType === 'Sentinel-3') {
+        // Đối với Sentinel-3, chọn và đổi tên các băng tần phù hợp
+        processedImage = image.select(
+            ['Oa02', 'Oa04', 'Oa06', 'Oa08', 'Oa17'],
+            ['Blue', 'Green', 'Red', 'NIR', 'SWIR1']
+        );
+        print('Lưu ý: Dữ liệu Sentinel-3 OLCI có đặc điểm bands khác biệt. Các chỉ số có thể không so sánh trực tiếp với dữ liệu phản xạ bề mặt (SR) của Landsat/Sentinel-2.');
+    } else {
+        // Trả về null nếu loại vệ tinh không được hỗ trợ
+        return null;
+    }
+    return processedImage;
+};
+
+// Hàm tính toán NDVI (Normalized Difference Vegetation Index)
+var calculateNDVI = function(image) {
+    return image.normalizedDifference(['NIR', 'Red']).rename('NDVI');
+};
+
+// Hàm tính toán NDWI (Normalized Difference Water Index)
+var calculateNDWI = function(image) {
+    return image.normalizedDifference(['Green', 'NIR']).rename('NDWI');
+};
+
+// Hàm tính toán NDMI (Normalized Difference Moisture Index)
+var calculateNDMI = function(image) {
+    return image.normalizedDifference(['NIR', 'SWIR1']).rename('NDMI');
+};
+
+// Hàm tính toán NBR (Normalized Burn Ratio)
+var calculateNBR = function(image) {
+    return image.normalizedDifference(['NIR', 'SWIR2']).rename('NBR');
+};
+
+// Hàm Tạo ảnh thumbnail thang màu cho chú giải
+var createGradientLegend = function(visParams) {
+    // Tạo một ảnh gradient từ min đến max của visParams
+    var gradientImage = ee.Image.pixelLonLat().select('longitude');
+    var rescaledGradient = gradientImage.unitScale(-180, 180).multiply(visParams.max - visParams.min).add(visParams.min);
+    // Hiển thị ảnh gradient với bảng màu đã định nghĩa
+    var visualizedStrip = rescaledGradient.visualize({
+        bands: ['longitude'],
+        min: visParams.min,
+        max: visParams.max,
+        palette: visParams.palette
+    });
+    // Tạo thumbnail cho thang màu
+    var thumbnail = ui.Thumbnail({
+        image: visualizedStrip,
+        params: {
+            dimensions: '256x20',
+            format: 'png',
+        },
+        style: {
+            stretch: 'horizontal',
+            margin: '0px 8px',
+            border: '1px solid grey'
+        }
+    });
+    return thumbnail;
+};
+
+// --- KHỞI TẠO DỮ LIỆU TỈNH (ĐẶT Ở ĐẦU SCRIPT) ---
+// Lấy bộ sưu tập các ranh giới hành chính cấp 1 của Việt Nam từ FAO/GAUL/2015
+provinces = ee.FeatureCollection('FAO/GAUL/2015/level1')
+    .filter(ee.Filter.eq('ADM0_NAME', 'Viet Nam'));
+// <-- KẾT THÚC THÊM/SỬA ĐỔI ĐỂ TÍCH HỢP CHỌN TỈNH -->
+
+
+// --- BLOCK 1: Giao Diện Người Dùng (UI) & CÔNG CỤ VẼ ---
+
+// 1. Thiết lập bố cục chính: panel ở trái, map ở phải
+controlPanel = ui.Panel({
+    layout: ui.Panel.Layout.flow('vertical'),
+    style: { width: '350px' }
+});
+
+map = ui.Map();
+
+// Xóa các phần tử gốc và đặt lại bố cục
+ui.root.clear();
+ui.root.setLayout(ui.Panel.Layout.flow('horizontal'));
+ui.root.add(controlPanel);
+ui.root.add(map);
+
+// Đặt bản đồ về trung tâm Việt Nam (Hà Nội)
+map.setCenter(105.8, 21.0, 6);
+
+
+// --- THIẾT LẬP CÔNG CỤ VẼ CHO BẢN ĐỒ MỚI ---
+drawingTools = map.drawingTools();
+drawingTools.layers().reset(); // Đảm bảo có một lớp vẽ trống khi khởi tạo
+
+drawingTools.setShown(true); // Hiển thị các nút công cụ vẽ trên bản đồ
+drawingTools.setDrawModes(['rectangle', 'polygon']); // Cho phép vẽ hình chữ nhật và đa giác
+drawingTools.setLinked(false); // Ngăn không cho công cụ vẽ tự động liên kết với lớp riêng
+
+// Event listeners cho drawingTools
+// Khi người dùng vẽ một hình mới
+drawingTools.onDraw(function(geo) {
+    aoi = geo; // Cập nhật biến aoi (Area of Interest) là hình vừa vẽ
+    lastDrawnGeometry = geo; // Cập nhật lastDrawnGeometry cho việc xuất
+    drawingTools.stop(); // Dừng chế độ vẽ sau khi vẽ xong
+    updateMapDisplay(); // Gọi hàm để cập nhật hiển thị AOI trên bản đồ
+});
+
+// Khi người dùng chỉnh sửa hình đã vẽ
+drawingTools.onEdit(function(geo) {
+    aoi = geo; // Cập nhật biến aoi là hình đã chỉnh sửa
+    lastDrawnGeometry = geo; // Cập nhật lastDrawnGeometry cho việc xuất
+    updateMapDisplay(); // Gọi hàm để cập nhật hiển thị AOI trên bản đồ
+});
+
+// Hàm để cập nhật hiển thị AOI trên bản đồ
+function updateMapDisplay() {
+    map.layers().reset(); // Xóa tất cả các lớp trên bản đồ (bao gồm cả AOI cũ)
+    if (aoi) {
+        // Thêm lớp AOI mới với màu đỏ và độ trong suốt 50%
+        map.addLayer(aoi, {color: 'red', opacity: 0.5}, 'Khu vực quan tâm');
+        map.centerObject(aoi); // Căn giữa bản đồ vào khu vực AOI
+    } else {
+        // Nếu aoi là null (chưa có vùng nào được chọn/vẽ), kích hoạt lại chế độ vẽ để người dùng có thể vẽ
+        drawingTools.draw();
+    }
+}
+// <-- KẾT THÚC THÊM/SỬA ĐỔI ĐỂ TÍCH HỢP CHỌN TỈNH -->
+
+// --- THÊM CÁC THÀNH PHẦN ĐIỀU KHIỂN VÀO PANEL ---
+
+controlPanel.add(ui.Label('Ứng dụng Hiệu chỉnh và phân tích ảnh', {fontWeight: 'bold', fontSize: '18px'}));
+controlPanel.add(ui.Label('Vẽ khu vực quan tâm trên bản đồ bằng các công cụ vẽ hoặc chọn tỉnh từ danh sách.', {fontSize: '16px'}));
+
+// Tạo placeholder cho dropdown tỉnh
+controlPanel.add(ui.Label('1. Chọn tỉnh:', {fontWeight: 'bold'}));
+var provinceDropdownPlaceholder = ui.Panel();
+controlPanel.add(provinceDropdownPlaceholder);
+
+// Lấy danh sách tên các tỉnh từ FeatureCollection và điền vào dropdown
+provinces.aggregate_array('ADM1_NAME').evaluate(function(list) {
+  var provinceDropdown = ui.Select({
+    items: list,
+    placeholder: 'Chọn tỉnh',
+    onChange: function(name) {
+      // Xóa tất cả các lớp vẽ hiện có khi chọn tỉnh mới
+      drawingTools.layers().reset();
+      drawingTools.stop(); // Dừng chế độ vẽ
+
+      // Lọc ra tỉnh đã chọn từ FeatureCollection
+      var selectedProvince = provinces.filter(ee.Filter.eq('ADM1_NAME', name));
+      // Lấy hình học của tỉnh đã chọn
+      selectedProvince.geometry().evaluate(function(clientGeometry) {
+        if (clientGeometry) {
+          aoi = ee.Geometry(clientGeometry); // Gán hình học tỉnh cho biến aoi
+          lastDrawnGeometry = aoi; // Cập nhật lastDrawnGeometry cho việc xuất
+          map.centerObject(aoi, 8); // Trung tâm bản đồ vào tỉnh đã chọn với mức zoom 8
+          updateMapDisplay(); // Cập nhật hiển thị AOI
+        } else {
+          statusLabel.setValue('Cảnh báo: Không xác định được vùng cho tỉnh đã chọn.');
+          statusLabel.style().set({color: 'orange'});
+        }
+      });
+    },
+    style: {width: '95%'}
+  });
+
+  // Thêm dropdown vào đúng vị trí placeholder
+  provinceDropdownPlaceholder.clear();
+  provinceDropdownPlaceholder.add(provinceDropdown);
+});
+
+
+controlPanel.add(ui.Label('')); // Giữ lại label trống để tạo khoảng cách
+controlPanel.add(ui.Label('2. Chọn khoảng thời gian để phân tích:', {fontWeight: 'bold'})); // Đổi số thứ tự
+
+// Panel chứa textbox ngày bắt đầu
+var startDatePanel = ui.Panel({
+    widgets: [
+        ui.Label('Từ ngày (YYYY-MM-DD):', {fontSize: '12px', width: '130px'}),
+        ui.Textbox({
+            value: '2023-01-01', // Giá trị mặc định
+            style: {width: '120px'}
+        })
+    ],
+    layout: ui.Panel.Layout.flow('horizontal'),
+    style: {margin: '0 0 5px 0'}
+});
+controlPanel.add(startDatePanel);
+startDateTextbox = startDatePanel.widgets().get(1); // Gán textbox vào biến toàn cục
+
+// Panel chứa textbox ngày kết thúc
+var endDatePanel = ui.Panel({
+    widgets: [
+        ui.Label('Đến ngày (YYYY-MM-DD):', {fontSize: '12px', width: '130px'}),
+        ui.Textbox({
+            value: ee.Date(Date.now()).format('YYYY-MM-dd').getInfo(), // Ngày hiện tại
+            style: {width: '120px'}
+        })
+    ],
+    layout: ui.Panel.Layout.flow('horizontal'),
+    style: {margin: '0 0 10px 0'}
+});
+controlPanel.add(endDatePanel);
+endDateTextbox = endDatePanel.widgets().get(1); // Gán textbox vào biến toàn cục
+
+// 2. Dropdown chọn loại ảnh vệ tinh
+controlPanel.add(ui.Label('3. Chọn loại ảnh vệ tinh:', {fontWeight: 'bold'}));
+satelliteSelect = ui.Select({
+    items: ['Landsat 8', 'Landsat 9', 'Sentinel-2', 'Sentinel-3'],
+    placeholder: 'Chọn vệ tinh',
+});
+controlPanel.add(satelliteSelect);
+
+// 3. Dropdown chọn Chỉ số / Tổ hợp băng tần
+controlPanel.add(ui.Label('3. Chọn Chỉ số / Tổ hợp băng tần:', {fontWeight: 'bold'}));
+indexSelect = ui.Select({
+    items: [
+        'True Color (RGB:Màu tự nhiên)',
+        'Color Infrared (CIR: Kênh cận hồng ngoại)',
+        'Agriculture (SWIR1,NIR,Red: Nông nghiệp)',
+        'Geology (SWIR2,SWIR1,NIR: Địa chất)',
+        'Urban (SWIR2,SWIR1,Red: Đô thị)',
+        'NDVI (Chỉ số thực vật)',
+        'NDWI (Chỉ số nước chênh lệch chuẩn hóa)',
+        'NDMI (Chỉ số độ ẩm thực vật)',
+        'NBR (Chỉ số cháy rừng)',
+        'Red Band (Kênh Đỏ)',
+        'Green Band (Kênh Xanh Lá)',
+        'Blue Band (Kênh Xanh Lam)',
+    ],
+    placeholder: 'Chọn chỉ số hoặc tổ hợp',
+});
+controlPanel.add(indexSelect);
+
+// 4. Thanh trượt chọn mật độ mây tối đa
+controlPanel.add(ui.Label('5. Mật độ mây tối đa (%):', {fontWeight: 'bold'}));
+cloudSlider = ui.Slider({
+    min: 0, max: 100, value: 20, step: 1, // Min 0, Max 100, Giá trị mặc định 20, Bước nhảy 1
+    style: {width: '90%'}
+});
+controlPanel.add(cloudSlider);
+
+controlPanel.add(ui.Label('')); // Khoảng cách
+
+// 5. Nút Xử lý chính
+processButton = ui.Button({
+    label: '6. Xử lý và Hiển thị Kết quả',
+    style: {width: '100%'}
+});
+controlPanel.add(processButton);
+
+controlPanel.add(ui.Label('')); // Khoảng cách
+
+// --- THIẾT LẬP PANEL CHÚ GIẢI (NỔI TRÊN BẢN ĐỒ) ---
+legendPanel = ui.Panel({
+    style: {
+        position: 'bottom-left', // Vị trí góc dưới bên trái của bản đồ
+        padding: '8px 15px',
+        border: '1px solid grey',
+        margin: '0',
+        backgroundColor: 'rgba(255, 255, 255, 0.8)' // Nền trắng trong suốt
+    }
+});
+map.add(legendPanel); // Thêm chú giải vào bản đồ
+
+// 6. Khu vực hiển thị kết quả phân tích thống kê
+controlPanel.add(ui.Label('7. Kết Quả Phân tích:', {fontWeight: 'bold'}));
+resultsPanel = ui.Panel({
+    style: {
+        border: '1px solid grey', padding: '8px', margin: '4px 0',
+        minHeight: '100px'
+    }
+});
+controlPanel.add(resultsPanel);
+
+// Label hiển thị trạng thái xử lý
+statusLabel = ui.Label('');
+controlPanel.add(statusLabel);
+
+// Label hiển thị giá trị pixel khi click vào bản đồ
+pixelValueLabel = ui.Label('Click vào bản đồ để xem giá trị');
+controlPanel.add(pixelValueLabel);
+
+// Textbox nhập tên file xuất
+controlPanel.add(ui.Label('Tên File Xuất (Tùy chọn):', {fontWeight: 'bold', fontSize: '12px', margin: '10px 0 0 0'}));
+exportFilenameTextbox = ui.Textbox({
+    placeholder: 'Nhập tên file...',
+    style: {width: '100%'}
+});
+controlPanel.add(exportFilenameTextbox);
+
+// Nút xuất dữ liệu ra Google Drive
+exportButton = ui.Button({
+    label: 'Tải xuống (Xuất ra Google Drive)',
+    style: {width: '100%', margin: '10px 0'},
+    disabled: true // Ban đầu vô hiệu hóa nút xuất
+});
+controlPanel.add(exportButton);
+
+// Nút xóa tất cả các lớp và reset trạng thái
+clearButton = ui.Button({
+    label: 'Xóa Tất Cả',
+    style: {width: '100%', margin: '10px 0'}
+});
+controlPanel.add(clearButton);
+
+
+// --- Kết thúc BLOCK 1 ---
+
+// --- BLOCK 2, 3, 4: Hàm Xử lý Chính runAnalysis ---
+// Hàm chứa logic của Block 2 (Lọc ảnh), Block 3 (Tính toán & Hiển thị setup),
+// và Block 4 (Hiển thị Map & Kết quả Phân tích).
+
+
+// --- Hàm Xử lý Chính runAnalysis ---
+var runAnalysis = function() {
+    // 1.Xóa kết quả và trạng thái cũ khi bắt đầu phân tích mới
+    resultsPanel.clear();
+    legendPanel.clear();
+    statusLabel.setValue('Đang xử lý...');
+    statusLabel.style().set({color: 'gray'});
+    pixelValueLabel.setValue('Click vào bản đồ để xem giá trị');
+
+    exportButton.setDisabled(true); // Vô hiệu hóa nút xuất
+    lastAnalysisImage = null; // Reset ảnh phân tích cuối cùng
+
+    // 2. Lấy thông tin đầu vào từ UI
+    // Kiểm tra xem đã có khu vực quan tâm (aoi) được chọn/vẽ hay chưa
+    if (!aoi) {
+        statusLabel.setValue('Lỗi: Vui lòng chọn một tỉnh hoặc vẽ một khu vực quan tâm trên bản đồ.');
+        statusLabel.style().set({color: 'red'});
+        return; // Dừng hàm nếu không có AOI
+    }
+    // Cập nhật lastDrawnGeometry từ aoi hiện tại để sử dụng cho chức năng xuất
+    lastDrawnGeometry = aoi;
+
+    var startDateString = startDateTextbox.getValue();
+    var endDateString = endDateTextbox.getValue();
+
+    // Kiểm tra nhập liệu ngày tháng
+    if (!startDateString || !endDateString) {
+        statusLabel.setValue('Lỗi: Vui lòng nhập cả ngày bắt đầu và ngày kết thúc.');
+        statusLabel.style().set({color: 'red'});
+        return;
+    }
+
+    var startDate;
+    var endDate;
+    try {
+        startDate = ee.Date(startDateString);
+        endDate = ee.Date(endDateString);
+    } catch (e) {
+        statusLabel.setValue('Lỗi: Định dạng ngày không hợp lệ hoặc ngày không tồn tại. Vui lòng sử dụng định dạng YYYY-MM-DD.');
+        statusLabel.style().set({color: 'red'});
+        print('Lỗi định dạng ngày:', e);
+        return;
+    }
+
+    // Kiểm tra ngày bắt đầu phải nhỏ hơn hoặc bằng ngày kết thúc
+    if (startDate.difference(endDate, 'day').getInfo() > 0) {
+        statusLabel.setValue('Lỗi: Ngày bắt đầu phải nhỏ hơn hoặc bằng ngày kết thúc.');
+        statusLabel.style().set({color: 'red'});
+        return;
+    }
+
+    var satelliteType = satelliteSelect.getValue();
+    if (!satelliteType) {
+        statusLabel.setValue('Lỗi: Vui lòng chọn loại ảnh vệ tinh.');
+        statusLabel.style().set({color: 'red'});
+        return;
+    }
+
+    var cloudPercentage = cloudSlider.getValue(); // Lấy giá trị mật độ mây
+
+
+  // --- BẮT ĐẦU LOGIC BLOCK 2 (Lọc & Chuẩn bị) ---
+  
+  
+    // 3.Truy cập và lọc bộ sưu tập ảnh vệ tinh
+    var collectionId;
+    if (satelliteType === 'Landsat 8') {
+        collectionId = 'LANDSAT/LC08/C02/T1_L2';
+    } else if (satelliteType === 'Landsat 9') {
+        collectionId = 'LANDSAT/LC09/C02/T1_L2';
+    } else if (satelliteType === 'Sentinel-2') {
+      // Sử dụng bộ sưu tập Surface Reflectance Level 2A
+        collectionId = 'COPERNICUS/S2_SR';
+    } else if (satelliteType === 'Sentinel-3') {
+      // ID bộ sưu tập Sentinel-3 không có quyền truy cập 
+        collectionId = 'COPERNICUS/S3/OLCI/SY_3_TP_SP';
+    } else {
+        statusLabel.setValue('Lỗi: Loại vệ tinh không hợp lệ.');
+        statusLabel.style().set({color: 'red'});
+        return;
+    }
+
+    var collection;
+    try {
+        collection = ee.ImageCollection(collectionId);
+    } catch (e) {
+        statusLabel.setValue('Lỗi: Không thể truy cập bộ sưu tập ' + collectionId + '. Vui lòng kiểm tra lại ID hoặc quyền truy cập. Chi tiết lỗi: ' + e);
+        statusLabel.style().set({color: 'red'});
+        print('Lỗi truy cập bộ sưu tập:', e);
+        return;
+    }
+
+    // Lọc bộ sưu tập ảnh theo khu vực quan tâm (aoi) và khoảng thời gian
+    collection = collection.filterBounds(aoi)
+        .filterDate(startDate, endDate);
+
+    // Lọc theo mật độ mây dựa trên loại vệ tinh
+    if (satelliteType === 'Landsat 8' || satelliteType === 'Landsat 9') {
+        collection = collection.filterMetadata('CLOUD_COVER_LAND', 'less_than', cloudPercentage);
+    } else if (satelliteType === 'Sentinel-2') {
+        collection = collection.filterMetadata('CLOUDY_PIXEL_PERCENTAGE', 'less_than', cloudPercentage);
+        // Chọn các băng tần cần thiết cho Sentinel-2 để giảm tải xử lý
+        var bandNamesS2 = ['B2', 'B3', 'B4', 'B8', 'B11', 'B12'];// Xanh dương, Xanh lá, Đỏ, NIR, SWIR1, SWIR2
+        collection = collection.select(bandNamesS2);
+    }
+
+    // 4.Đếm số lượng ảnh sau khi lọc
+    var count = collection.size();
+    // Sử dụng evaluate để lấy giá trị từ server (bất đồng bộ)
+    count.evaluate(function(numImages) {
+        if (numImages === 0) {
+            // Thông báo lỗi nếu không tìm thấy ảnh nào
+            statusLabel.setValue('Lỗi: Không tìm thấy ảnh nào phù hợp với tiêu chí lọc (sau lọc theo thời gian, vị trí và tỷ lệ mây). Vui lòng thử lại với mật độ mây cao hơn hoặc khoảng thời gian khác.');
+            statusLabel.style().set({color: 'red'});
+        } else {
+            statusLabel.setValue('Tìm thấy ' + numImages + ' ảnh. Đang tạo composite...');
+            statusLabel.style().set({color: 'gray'});
+
+            // 5.Tạo ảnh composite từ tập hợp ảnh (sử dụng giá trị median - trung vị)
+            var composite = collection.median();
+            
+            // 6.Chuẩn bị ảnh (scaling factor và đổi tên băng tần)
+            var processedImage = prepSatelliteImage(composite, satelliteType);
+
+            if (!processedImage) {
+                statusLabel.setValue('Lỗi: Không xử lý được ảnh (scaling/renaming) cho loại vệ tinh này hoặc ảnh không có đủ băng tần cần thiết.');
+                statusLabel.style().set({color: 'red'});
+                return;
+            }
+
+            // Cắt ảnh composite theo khu vực quan tâm (aoi)
+            var clippedImage = processedImage.clip(aoi);
+            
+      // --- KẾT THÚC LOGIC BLOCK 2 ---
+      
+       // --- BẮT ĐẦU LOGIC BLOCK 3 (Tính toán & Hiển thị setup) ---
+        // 7. Lấy lựa chọn chỉ số/tổ hợp từ UI
+            var analysisType = indexSelect.getValue(); // Lấy loại phân tích đã chọn
+            if (!analysisType) {
+                statusLabel.setValue('Lỗi nội bộ: Loại phân tích không xác định.');
+                statusLabel.style().set({color: 'red'});
+                return;
+            }
+      // Các biến để lưu kết quả ảnh cần hiển thị và thông số hiển thị
+            var imageToDisplay; // Biến lưu trữ ảnh sẽ hiển thị
+            var visualizationParameters; // Biến lưu trữ các thông số hiển thị
+            var layerName = analysisType + ' (' + satelliteType + ')'; // Tên lớp hiển thị trên bản đồ
+            
+            
+      // 8. Tính toán Chỉ số / Chọn băng tần dựa trên lựa chọn
+            // Logic tính toán và thiết lập thông số hiển thị cho từng loại phân tích
+            if (analysisType === 'NDVI (Chỉ số thực vật)') {
+                // Kiểm tra các băng tần cần thiết
+                if (clippedImage.bandNames().indexOf('Red') === -1 || clippedImage.bandNames().indexOf('NIR') === -1) {
+                    statusLabel.setValue('Lỗi: Ảnh vệ tinh được chọn không có các băng Red/NIR cho tính NDVI.'); statusLabel.style().set({color: 'red'}); return;
+                }
+                imageToDisplay = calculateNDVI(clippedImage);
+                visualizationParameters = { min: -1, max: 1, palette: ['blue', 'white', 'green'] };
+            } else if (analysisType === 'NDWI (Chỉ số nước chênh lệch chuẩn hóa)') {
+                if (clippedImage.bandNames().indexOf('Green') === -1 || clippedImage.bandNames().indexOf('NIR') === -1) {
+                    statusLabel.setValue('Lỗi: Ảnh vệ tinh được chọn không có các băng Green/NIR cho tính NDWI.'); statusLabel.style().set({color: 'red'}); return;
+                }
+                imageToDisplay = calculateNDWI(clippedImage);
+                visualizationParameters = { min: -1, max: 1, palette: ['#ece7f2', '#a6bddb', '#74a9cf', '#2b8cbe', '#045a8d'] };
+            } else if (analysisType === 'NDMI (Chỉ số độ ẩm thực vật)') {
+                if (clippedImage.bandNames().indexOf('NIR') === -1 || clippedImage.bandNames().indexOf('SWIR1') === -1) {
+                    statusLabel.setValue('Lỗi: Ảnh vệ tinh được chọn không có các băng NIR/SWIR1 cho tính NDMI.'); statusLabel.style().set({color: 'red'}); return;
+                }
+                imageToDisplay = calculateNDMI(clippedImage);
+                visualizationParameters = { min: -1, max: 1, palette: ['red', 'yellow', 'green', 'cyan', 'blue'] };
+            } else if (analysisType === 'NBR (Chỉ số cháy rừng)') {
+                if (clippedImage.bandNames().indexOf('NIR') === -1 || clippedImage.bandNames().indexOf('SWIR2') === -1) {
+                    statusLabel.setValue('Lỗi: Ảnh vệ tinh được chọn không có các băng NIR/SWIR2 cho tính NBR.'); statusLabel.style().set({color: 'red'}); return;
+                }
+                imageToDisplay = calculateNBR(clippedImage);
+                visualizationParameters = {
+                    min: -1, max: 1,
+                    palette: ['#4d0000','#990000','#ff0000','#ffbd54','#ffff00','#00ff00','#008000','#006800'] // Bảng màu đặc trưng cho NBR
+                };
+            } else if (analysisType === 'True Color (RGB:Màu tự nhiên)') {
+                if (clippedImage.bandNames().indexOf('Red') === -1 || clippedImage.bandNames().indexOf('Green') === -1 || clippedImage.bandNames().indexOf('Blue') === -1) {
+                    statusLabel.setValue('Lỗi: Ảnh vệ tinh được chọn không có các băng Red/Green/Blue cho True Color.'); statusLabel.style().set({color: 'red'}); return;
+                }
+                imageToDisplay = clippedImage.select(['Red', 'Green', 'Blue']);
+                visualizationParameters = { bands: ['Red', 'Green', 'Blue'], min: 0, max: 0.3 };
+            } else if (analysisType === 'Color Infrared (CIR: Kênh cận hồng ngoại)') {
+                if (clippedImage.bandNames().indexOf('NIR') === -1 || clippedImage.bandNames().indexOf('Red') === -1 || clippedImage.bandNames().indexOf('Green') === -1) {
+                    statusLabel.setValue('Lỗi: Ảnh vệ tinh được chọn không có các băng NIR/Red/Green cho CIR.'); statusLabel.style().set({color: 'red'}); return;
+                }
+                imageToDisplay = clippedImage.select(['NIR', 'Red', 'Green']);
+                visualizationParameters = { bands: ['NIR', 'Red', 'Green'], min: 0, max: 0.4 };
+            } else if (analysisType === 'Agriculture (SWIR1,NIR,Red: Nông nghiệp)') {
+                if (clippedImage.bandNames().indexOf('SWIR1') === -1 || clippedImage.bandNames().indexOf('NIR') === -1 || clippedImage.bandNames().indexOf('Red') === -1) {
+                    statusLabel.setValue('Lỗi: Ảnh vệ tinh được chọn không có các băng SWIR1/NIR/Red cho tổ hợp Nông nghiệp.'); statusLabel.style().set({color: 'red'}); return;
+                }
+                imageToDisplay = clippedImage.select(['SWIR1', 'NIR', 'Red']);
+                visualizationParameters = { bands: ['SWIR1', 'NIR', 'Red'], min: 0, max: 0.5 };
+            } else if (analysisType === 'Geology (SWIR2,SWIR1,NIR: Địa chất)') {
+                if (clippedImage.bandNames().indexOf('SWIR2') === -1 || clippedImage.bandNames().indexOf('SWIR1') === -1 || clippedImage.bandNames().indexOf('NIR') === -1) {
+                    statusLabel.setValue('Lỗi: Ảnh vệ tinh được chọn không có các băng SWIR2/SWIR1/NIR cho tổ hợp Địa chất.'); statusLabel.style().set({color: 'red'}); return;
+                }
+                imageToDisplay = clippedImage.select(['SWIR2', 'SWIR1', 'NIR']);
+                visualizationParameters = { bands: ['SWIR2', 'SWIR1', 'NIR'], min: 0, max: 0.6 };
+            } else if (analysisType === 'Urban (SWIR2,SWIR1,Red: Đô thị)') {
+                if (clippedImage.bandNames().indexOf('SWIR2') === -1 || clippedImage.bandNames().indexOf('SWIR1') === -1 || clippedImage.bandNames().indexOf('Red') === -1) {
+                    statusLabel.setValue('Lỗi: Ảnh vệ tinh được chọn không có các băng SWIR2/SWIR1/Red cho tổ hợp Đô thị.'); statusLabel.style().set({color: 'red'}); return;
+                }
+                imageToDisplay = clippedImage.select(['SWIR2', 'SWIR1', 'Red']);
+                visualizationParameters = { bands: ['SWIR2', 'SWIR1', 'Red'], min: 0, max: 0.5 };
+            } else if (analysisType === 'Red Band (Kênh Đỏ)') {
+                if (clippedImage.bandNames().indexOf('Red') === -1) {
+                    statusLabel.setValue('Lỗi: Ảnh vệ tinh được chọn không có băng Red.'); statusLabel.style().set({color: 'red'}); return;
+                }
+                imageToDisplay = clippedImage.select('Red');
+                visualizationParameters = { bands: ['Red'], min: 0, max: 0.3, palette: ['black', 'red'] };
+            } else if (analysisType === 'Green Band (Kênh Xanh Lá)') {
+                if (clippedImage.bandNames().indexOf('Green') === -1) {
+                    statusLabel.setValue('Lỗi: Ảnh vệ tinh được chọn không có băng Green.'); statusLabel.style().set({color: 'red'}); return;
+                }
+                imageToDisplay = clippedImage.select('Green');
+                visualizationParameters = { bands: ['Green'], min: 0, max: 0.3, palette: ['black', 'green'] };
+            } else if (analysisType === 'Blue Band (Kênh Xanh Lam)') {
+                if (clippedImage.bandNames().indexOf('Blue') === -1) {
+                    statusLabel.setValue('Lỗi: Ảnh vệ tinh được chọn không có băng Blue.'); statusLabel.style().set({color: 'red'}); return;
+                }
+                imageToDisplay = clippedImage.select('Blue');
+                visualizationParameters = { bands: ['Blue'], min: 0, max: 0.3, palette: ['black', 'blue'] };
+            }
+            else {
+                statusLabel.setValue('Lỗi nội bộ: Loại phân tích không được hỗ trợ.'); statusLabel.style().set({color: 'red'}); return;
+            }
+
+
+      // --- KẾT THÚC LOGIC BLOCK 3 ---
+
+
+      // --- BẮT ĐẦU LOGIC BLOCK 4 (Hiển thị Map & Kết quả Phân tích) ---
+
+            // Xóa các lớp cũ trên bản đồ
+            map.layers().reset();
+            // Thêm lại lớp AOI đã chọn/vẽ lên bản đồ để người dùng thấy
+            map.addLayer(aoi, {color: 'red', opacity: 0.5}, 'Khu vực quan tâm đã chọn');
+
+            // 9. Hiển thị imageToDisplay lên bản đồ
+            map.addLayer(imageToDisplay, visualizationParameters, layerName);
+
+            // Đặt bản đồ về trung tâm vùng AOI sau khi thêm lớp
+            map.centerObject(aoi); // <-- ĐÃ SỬA ĐỔI: centerObject vào 'aoi', cũ là cái lastdrawgeometry
+
+            // Lưu trữ ảnh và geometry cho việc xuất và kích hoạt nút xuất
+            lastAnalysisImage = imageToDisplay; // imageToDisplay đã được xử lý và cắt
+            // lastDrawnGeometry đã được cập nhật từ aoi ở đầu hàm runAnalysis
+            exportButton.setDisabled(false); // Kích hoạt nút xuất
+
+            // ĐẶT CON TRỎ THÀNH HÌNH CHỮ THẬP KHI HIỂN THỊ ẢNH PHÂN TÍCH
+            map.style().set('cursor', 'crosshair');
+
+            // BẮT ĐẦU CẬP NHẬT CHÚ GIẢI TRÊN BẢN ĐỒ
+            legendPanel.clear(); // Xóa chú giải cũ
+            legendPanel.add(ui.Label(layerName, {fontWeight: 'bold', fontSize: '13px', margin: '0 0 4px 0'})); // Tiêu đề chú giải là tên lớp
+
+            // Kiểm tra xem kết quả hiển thị có phải là chỉ số đơn băng hay không để vẽ thang màu
+            var isIndexForLegend = ['NDVI (Chỉ số thực vật)', 'NDWI (Chỉ số nước chênh lệch chuẩn hóa)',
+                                    'NDMI (Chỉ số độ ẩm thực vật)', 'NBR (Chỉ số cháy rừng)'].indexOf(analysisType) > -1;
+
+            //Định nghĩa ý nghĩa Bảng điều khiển MỘT LẦN ở đây
+            var meaningPanel = ui.Panel({ layout: ui.Panel.Layout.flow('vertical'), style: {margin: '0 8px'} });
+
+            if (isIndexForLegend) { // Hiển thị thang màu và giải thích chi tiết cho chỉ số
+                // Thêm thanh màu gradient
+                var colorBar = createGradientLegend(visualizationParameters); // Gọi hàm trợ giúp
+                legendPanel.add(colorBar);
+
+                // Thêm nhãn cho giá trị min và max
+                var minMaxLabels = ui.Panel({
+                    widgets: [
+                        ui.Label(visualizationParameters.min.toFixed(2), {margin: '0px 8px 0px 0px', fontSize: '11px'}),
+                        ui.Label(visualizationParameters.max.toFixed(2), {margin: '0px 0px 0px 8px', textAlign: 'right', stretch: 'horizontal', fontSize: '11px'})
+                    ],
+                    layout: ui.Panel.Layout.flow('horizontal')
+                });
+                legendPanel.add(minMaxLabels);
+
+                // Thêm label 'Ý nghĩa màu sắc:' cho chỉ số
+                legendPanel.add(ui.Label('Ý nghĩa màu sắc:', {fontWeight: 'bold', fontSize: '11px', margin: '4px 0 0 0'}));
+
+                // Thêm nhãn giải thích chi tiết cho các chỉ số vào panel meaning duy nhất
+                if (analysisType === 'NDVI (Chỉ số thực vật)') {
+                    meaningPanel.add(ui.Label('< 0: Nước, băng tuyết, mây', {fontSize: '10px'}));
+                    meaningPanel.add(ui.Label('0 - 0.1: Đất trống, đá, công trình', {fontSize: '10px'}));
+                    meaningPanel.add(ui.Label('0.1 - 0.2: Thực vật rất thưa thớt', {fontSize: '10px'}));
+                    meaningPanel.add(ui.Label('0.2 - 0.5: Thực vật thảm cỏ, cây trồng, rừng', {fontSize: '10px'}));
+                    meaningPanel.add(ui.Label('> 0.5: Thực vật dày đặc, cây trồng tốt', {fontSize: '10px'}));
+                } else if (analysisType === 'NDWI (Chỉ số nước chênh lệch chuẩn hóa)') {
+                    meaningPanel.add(ui.Label('< 0.1: Đất trống, thực vật, công trình', {fontSize: '10px'}));
+                    meaningPanel.add(ui.Label('0.1 - 0.2: Nước có lẫn trầm tích hoặc vùng đất ngập nước nông', {fontSize: '10px'}));
+                    meaningPanel.add(ui.Label('> 0.2: Vùng nước (sông, hồ, biển), càng cao càng trong', {fontSize: '10px'}));
+                } else if (analysisType === 'NDMI (Chỉ số độ ẩm thực vật)') {
+                    meaningPanel.add(ui.Label('< 0: Độ ẩm rất thấp (khô hạn)', {fontSize: '10px'}));
+                    meaningPanel.add(ui.Label('0 - 0.1: Độ ẩm thấp', {fontSize: '10px'}));
+                    meaningPanel.add(ui.Label('0.1 - 0.2: Độ ẩm trung bình', {fontSize: '10px'}));
+                    meaningPanel.add(ui.Label('0.2 - 0.4: Độ ẩm cao', {fontSize: '10px'}));
+                    meaningPanel.add(ui.Label('> 0.4: Độ ẩm rất cao', {fontSize: '10px'}));
+                } else if (analysisType === 'NBR (Chỉ số cháy rừng)') {
+                    meaningPanel.add(ui.Label('> 0.4: Thực vật rất khỏe mạnh', {fontSize: '10px'}));
+                    meaningPanel.add(ui.Label('0.25 - 0.4: Thực vật khỏe mạnh', {fontSize: '10px'}));
+                    meaningPanel.add(ui.Label('0.1 - 0.25: Thực vật thưa thớt/phục hồi', {fontSize: '10px'}));
+                    meaningPanel.add(ui.Label('0 - 0.1: Đất trống, đá', {fontSize: '10px'}));
+                    meaningPanel.add(ui.Label('-0.1 - 0: Cháy nhẹ/phục hồi sớm', {fontSize: '10px'}));
+                    meaningPanel.add(ui.Label('<-0.1: Cháy nặng', {fontSize: '10px'}));
+                }
+                legendPanel.add(meaningPanel); // <--- Thêm meaningPanel vào legendPanel một lần duy nhất
+            } else { // Đối với tổ hợp màu hoặc băng đơn (chỉ hiển thị tên lớp và giải thích màu sắc chung)
+                // Tên lớp đã có ở trên
+
+                // Thêm nhãn giải thích chung cho tổ hợp màu và băng đơn vào panel meaning duy nhất
+                legendPanel.add(ui.Label('Màu sắc chung:', {fontWeight: 'bold', fontSize: '11px', margin: '4px 0 0 0'})); // Added label back
+
+                if (analysisType === 'True Color (RGB:Màu tự nhiên)') {
+                    meaningPanel.add(ui.Label('- Mô phỏng màu sắc tự nhiên (giống mắt người nhìn).', {fontSize: '10px'}));
+                    meaningPanel.add(ui.Label('- Thực vật khỏe mạnh: Xanh lá cây.', {fontSize: '10px'}));
+                    meaningPanel.add(ui.Label('- Đất trống/Công trình: Nâu/Xám.', {fontSize: '10px'}));
+                    meaningPanel.add(ui.Label('- Nước: Xanh dương/Xanh lá/Đen.', {fontSize: '10px'}));
+                } else if (analysisType === 'Color Infrared (CIR: Kênh cận hồng ngoại)') {
+                    meaningPanel.add(ui.Label('- Nhấn mạnh thực vật khỏe mạnh (NIR phản xạ cao).', {fontSize: '10px'}));
+                    meaningPanel.add(ui.Label('- Thực vật khỏe mạnh: Đỏ tươi.', {fontSize: '10px'}));
+                    meaningPanel.add(ui.Label('- Đất trống: Nâu/Xám/Xanh lục nhạt.', {fontSize: '10px'}));
+                    meaningPanel.add(ui.Label('- Nước: Đen.', {fontSize: '10px'}));
+                } else if (analysisType === 'Agriculture (SWIR1,NIR,Red: Nông nghiệp)') {
+                    meaningPanel.add(ui.Label('- Tốt cho nông nghiệp, nhấn mạnh sự khác biệt thực vật và độ ẩm đất.', {fontSize: '10px'}));
+                    meaningPanel.add(ui.Label('- Thực vật khỏe mạnh: Xanh lá/Vàng/Cam tùy băng thông.', {fontSize: '10px'}));
+                    meaningPanel.add(ui.Label('- Đất khô: Sáng màu.', {fontSize: '10px'}));
+                    meaningPanel.add(ui.Label('- Đất ẩm/Nước: Tối màu.', {fontSize: '10px'}));
+                } else if (analysisType === 'Geology (SWIR2,SWIR1,NIR: Địa chất)') {
+                    meaningPanel.add(ui.Label('- Tốt cho phân biệt các loại đá, khoáng chất và đất dựa trên phổ phản xạ SWIR/NIR.', {fontSize: '10px'}));
+                    meaningPanel.add(ui.Label('- Màu đỏ/hồng: Phản xạ cao ở băng SWIR2 (ví dụ: khoáng sét, khoáng chứa OH).', {fontSize: '10px'}));
+                    meaningPanel.add(ui.Label('- Màu xanh lá/vàng: Phản xạ cao ở băng SWIR1 (ví dụ: một số loại đất, thực vật khô).', {fontSize: '10px'}));
+                    meaningPanel.add(ui.Label('- Màu xanh dương/cyan: Phản xạ cao ở băng NIR (ví dụ: thực vật khỏe mạnh).', {fontSize: '10px'}));
+                    meaningPanel.add(ui.Label('- Màu xám/đen: Phản xạ thấp.', {fontSize: '10px'}));
+                } else if (analysisType === 'Urban (SWIR2,SWIR1,Red: Đô thị)') {
+                    meaningPanel.add(ui.Label('- Tốt cho phân tích khu vực đô thị và đất trống.', {fontSize: '10px'}));
+                    meaningPanel.add(ui.Label('- Khu vực đô thị/Công trình: Hồng/Tím/Trắng.', {fontSize: '10px'}));
+                    meaningPanel.add(ui.Label('- Đất trống: Màu nâu.', {fontSize: '10px'}));
+                    meaningPanel.add(ui.Label('- Thực vật: Màu xanh lá.', {fontSize: '10px'}));
+                } else if (analysisType === 'Red Band (Băng Đỏ)') {
+                    meaningPanel.add(ui.Label('- Hiển thị cường độ phản xạ của băng Đỏ.', {fontSize: '10px'}));
+                } else if (analysisType === 'Green Band (Băng Xanh Lá)') {
+                    meaningPanel.add(ui.Label('- Hiển thị cường độ phản xạ của băng Xanh Lá.', {fontSize: '10px'}));
+                } else if (analysisType === 'Blue Band (Băng Xanh Lam)') {
+                    meaningPanel.add(ui.Label('- Hiển thị cường độ phản xạ của băng Xanh Lam.', {fontSize: '10px'}));
+                } else {
+                    meaningPanel.add(ui.Label('Không có mô tả cụ thể cho lựa chọn này.', {fontSize: '10px'}));
+                }
+                legendPanel.add(meaningPanel); // <--- Thêm meaningPanel vào legendPanel một lần duy nhất
+            }
+            // KẾT THÚC CẬP NHẬT CHÚ GIẢI
+
+            // 10. Tính toán thống kê (trung bình) và hiển thị kết quả phân tích
+            // Kiểm tra xem kết quả hiển thị có phải là chỉ số đơn băng hay không (dùng biến isIndex cũ cho thống kê)
+            var isIndexForAssessment = ['NDVI (Chỉ số thực vật)', 'NDWI (Chỉ số nước chênh lệch chuẩn hóa)',
+                                        'NDMI (Chỉ số độ ẩm thực vật)', 'NBR (Chỉ số cháy rừng)'].indexOf(analysisType) > -1;
+
+            if (isIndexForAssessment) {
+                // Nếu là chỉ số đơn băng, tính giá trị trung bình
+                statusLabel.setValue('Đang tính toán thống kê...');
+                statusLabel.style().set({color: 'gray'});
+
+                // Xác định scale (độ phân giải) để tính toán
+                var scale = processedImage.projection().nominalScale();
+                // TODO: Có thể thêm tùy chọn để người dùng chọn scale tính toán tại đây.
+
+                // Tính giá trị trung bình trong vùng AOI
+                var meanDictionary = imageToDisplay.reduceRegion({
+                    reducer: ee.Reducer.mean(), // Tính giá trị trung bình
+                    geometry: aoi, // <-- ĐÃ SỬA ĐỔI: Tính thống kê trên 'aoi'
+                    scale: scale, // Theo scale của ảnh đã xử lý
+                    maxPixels: 1e10 // Tăng giới hạn pixel để xử lý vùng lớn hơn
+                });
+
+                // Lấy giá trị trung bình từ kết quả Dictionary
+                var meanValue = meanDictionary.get(imageToDisplay.bandNames().get(0));
+
+                // Sử dụng evaluate để lấy giá trị từ server và xử lý kết quả trung bình (bất đồng bộ)
+                meanValue.evaluate(function(mean) {
+                    resultsPanel.clear(); // Xóa nội dung panel kết quả cũ
+
+                    // Hiển thị giá trị trung bình
+                    resultsPanel.add(ui.Label('Giá trị trung bình ' + analysisType + ':', {fontWeight: 'bold'}));
+                    // Kiểm tra null hoặc undefined trước khi gọi toFixed
+                    resultsPanel.add(ui.Label(mean !== null && mean !== undefined ? mean.toFixed(4) : 'Không có dữ liệu'));
+
+                    // 11. Đưa ra nhận xét văn bản dựa trên chỉ số và giá trị trung bình
+                    var assessmentText = 'Không có nhận xét cụ thể cho chỉ số này hoặc giá trị không xác định.';
+
+                    // CẬP NHẬT NHẬN XÉT CHI TIẾT HƠN TRONG RESULTS PANEL (CHỈ SỐ ĐƠN BĂNG)
+                    if (mean !== null && mean !== undefined) { // Chỉ đưa ra nhận xét nếu tính được giá trị trung bình hợp lệ
+                        if (analysisType === 'NDVI (Chỉ số thực vật)') {
+                            if (mean < 0) assessmentText = 'Khu vực có thể là nước, băng tuyết hoặc mây.';
+                            else if (mean >= 0 && mean < 0.1) assessmentText = 'Khu vực chủ yếu là đất trống, đá hoặc công trình xây dựng.';
+                            else if (mean >= 0.1 && mean < 0.2) assessmentText = 'Thực vật rất thưa thớt (ví dụ: cây bụi, sa mạc).';
+                            else if (mean >= 0.2 && mean < 0.5) assessmentText = 'Thực vật trung bình (ví dụ: thảm cỏ, cây trồng, rừng lá rụng).';
+                            else assessmentText = 'Thực vật rất tốt và dày đặc (ví dụ: rừng rậm, cây trồng phát triển mạnh).';
+                        } else if (analysisType === 'NDWI (Chỉ số nước chênh lệch chuẩn hóa)') {
+                            if (mean < 0.1) assessmentText = 'Khu vực này chủ yếu là đất trống, thực vật hoặc công trình xây dựng.';
+                            else if (mean >= 0.1 && mean < 0.2) assessmentText = 'Khu vực có thể là vùng nước có lẫn trầm tích hoặc vùng đất ngập nước nông.';
+                            else if (mean >= 0.2) assessmentText = 'Khu vực này là vùng nước (sông, hồ, biển). Giá trị càng cao cho thấy nước càng trong.';
+                            else assessmentText = 'Giá trị NDWI không xác định.'; // Ít khi xảy ra sau kiểm tra mean > 0 nhưng thêm cho an toàn
+                        } else if (analysisType === 'NDMI (Chỉ số độ ẩm thực vật)') {
+                            if (mean < 0) assessmentText = 'Độ ẩm thực vật và đất trong khu vực rất thấp, có thể đang khô hạn.';
+                            else if (mean >= 0 && mean < 0.1) assessmentText = 'Độ ẩm thấp.';
+                            else if (mean >= 0.1 && mean < 0.2) assessmentText = 'Độ ẩm trung bình.';
+                            else if (mean >= 0.2 && mean < 0.4) assessmentText = 'Độ ẩm cao.';
+                            else if (mean >= 0.4) assessmentText = 'Độ ẩm rất cao.';
+                            else assessmentText = 'Giá trị NDMI không xác định.'; // Ít khi xảy ra sau kiểm tra mean > 0 nhưng thêm cho an toàn
+                        } else if (analysisType === 'NBR (Chỉ số cháy rừng)') {
+                            // NBR: giá trị âm/thấp thường là vùng cháy sau sự kiện
+                            if (mean > 0.4) assessmentText = 'Thực vật trong khu vực rất khỏe mạnh.';
+                            else if (mean >= 0.25 && mean <= 0.4) assessmentText = 'Thực vật khỏe mạnh.';
+                            else if (mean >= 0.1 && mean < 0.25) assessmentText = 'Thực vật thưa thớt hoặc đang phục hồi sau tác động.';
+                            else if (mean >= 0 && mean < 0.1) assessmentText = 'Khu vực chủ yếu là đất trống hoặc đá.';
+                            else if (mean >= -0.1 && mean < 0) assessmentText = 'Có thể là vùng bị cháy nhẹ hoặc đang phục hồi rất sớm sau cháy.';
+                            else if (mean < -0.1) assessmentText = 'Khả năng cao là khu vực đã bị cháy nặng gần đây.';
+                        }
+                    }
+                    // Hiển thị nhận xét
+                    resultsPanel.add(ui.Label('Nhận xét:', {fontWeight: 'bold'}));
+                    resultsPanel.add(ui.Label(assessmentText));
+
+                    // Cập nhật trạng thái cuối cùng SAU KHI evaluate THÀNH CÔNG
+                    statusLabel.setValue('Hoàn thành.');
+                    statusLabel.style().set({color: 'green'});
+                }); // Kết thúc evaluate callback cho meanValue
+                
+                
+            } else { // Nếu không phải chỉ số đơn băng (là tổ hợp màu hoặc băng đơn)
+                // Không tính thống kê cho tổ hợp màu và băng đơn
+                resultsPanel.clear();
+                resultsPanel.add(ui.Label('Kết quả hiển thị trên bản đồ:', {fontWeight: 'bold'}));
+                resultsPanel.add(ui.Label(layerName));
+                resultsPanel.add(ui.Label('Lưu ý: Kết quả phân tích số liệu (giá trị trung bình, nhận xét) chủ yếu áp dụng cho các chỉ số đơn băng (NDVI, NDWI, ...). Vui lòng quan sát trực quan trên bản đồ.'));
+
+                // Cập nhật trạng thái cuối cùng ngay sau khi hiển thị panel
+                statusLabel.setValue('Hoàn thành.');
+                statusLabel.style().set({color: 'green'});
+            }
+                  // --- KẾT THÚC LOGIC BLOCK 4 ---
+
+        }// Kết thúc else (numImages > 0) - Từ Block 2
+    }); // Kết thúc evaluate (numImages) - Callback của collection.size().evaluate()
+}; // Kết thúc hàm runAnalysis - Từ Block 2
+
+// <--  HÀM XUẤT DỮ LIỆU TRỰC TIẾP TỪ INPUT TRÊN PANEL
+var exportImage = function() {
+    // Kiểm tra xem có ảnh và khu vực quan tâm (aoi) sẵn sàng để xuất không
+    if (!lastAnalysisImage || !aoi) { // <-- ĐÃ SỬA ĐỔI: Dùng aoi cho việc xuất
+        statusLabel.setValue('Lỗi: Không có ảnh hoặc khu vực quan tâm nào sẵn sàng để xuất. Vui lòng chạy phân tích trước.');
+        statusLabel.style().set({color: 'red'});
+        return;
+    }
+
+    // Lấy tên file người dùng nhập và làm sạch (chỉ giữ lại chữ, số, dấu gạch dưới, gạch ngang)
+    var userFilename = exportFilenameTextbox.getValue();
+    var sanitizedFilename = userFilename.replace(/[^a-zA-Z0-9_\-]/g, '_');
+
+    // Xác định tên xuất (dùng tên người dùng nếu có, ngược lại dùng tên mặc định)
+    var exportName;
+    if (sanitizedFilename && sanitizedFilename.length > 0) {
+        exportName = sanitizedFilename;
+    } else {
+        // Tạo tên mặc định nếu người dùng không nhập hoặc tên không hợp lệ
+        var satelliteType = satelliteSelect.getValue();
+        var analysisType = indexSelect.getValue();
+        // Làm sạch các thành phần để đảm bảo tên file hợp lệ
+        var defaultSatellite = satelliteType ? satelliteType.replace(/[^a-zA-Z0-9]/g, '_') : 'UnknownSatellite';
+        var defaultAnalysis = analysisType ? analysisType.replace(/[^a-zA-Z0-9]/g, '_') : 'UnknownAnalysis';
+        exportName = 'exported_' + defaultSatellite + '_' + defaultAnalysis;
+    }
+
+    // Sử dụng scale mặc định của ảnh cuối cùng (nominalScale)
+    var exportScale = lastAnalysisImage.projection().nominalScale();
+    
+  // Xuất ảnh 
+    statusLabel.setValue('Đang gửi yêu cầu xuất ảnh "' + exportName + '" sang Google Drive...');
+    statusLabel.style().set({color: 'gray'});
+
+    // Gửi yêu cầu xuất ảnh lên Google Drive
+    Export.image.toDrive({
+        image: lastAnalysisImage, // Ảnh cần xuất
+        description: exportName, // Mô tả task (hiển thị trong tab Tasks)
+        folder: 'GEE_Exports', // Tên thư mục trong Google Drive của bạn (hardcoded)
+        fileNamePrefix: exportName, // Dùng tên đã xác định làm tiền tố file
+        scale: exportScale, // Sử dụng scale đã xác định
+        region: aoi, // <-- ĐÃ SỬA ĐỔI: Vùng xuất là khu vực quan tâm (aoi)
+        maxPixels: 1e10 // Tăng giới hạn pixel để xử lý vùng lớn hơn
+        // Format mặc định là GeoTIFF khi xuất ra Drive
+    });
+
+    // Cập nhật thông báo trạng thái cuối cùng
+    var finalStatus = 'Yêu cầu xuất đã được gửi. Vui lòng kiểm tra tab Tasks (Nhiệm vụ) ở bên phải của trình chỉnh sửa Code Editor.';
+    statusLabel.setValue(finalStatus);
+    statusLabel.style().set({color: 'blue'}); // Sử dụng màu xanh để báo hiệu task đang chạy
+};
+// <-- KẾT THÚC HÀM XUẤT DỮ LIỆU TRỰC TIẾP TỪ INPUT TRÊN PANEL
+
+
+// Hàm xóa tất cả
+var clearAll = function() {
+    // Xóa nội dung các panel kết quả và trạng thái
+    resultsPanel.clear();
+    statusLabel.setValue('');
+    pixelValueLabel.setValue('Click vào bản đồ để xem giá trị'); // Reset giá trị click
+
+    // Xóa chú giải trên bản đồ
+    legendPanel.clear();
+
+    // Xóa tất cả các lớp trên bản đồ (bao gồm lớp hiển thị ảnh và lớp vẽ cũ)
+    map.layers().reset();
+
+    // Reset drawing tools layer để xóa hình vẽ cũ và chuẩn bị cho hình vẽ mới
+    drawingTools.layers().reset();
+    drawingTools.draw(); // Kích hoạt lại chế độ vẽ sau khi xóa để người dùng có thể vẽ lại
+
+    aoi = null; // Reset biến aoi về null
+    lastAnalysisImage = null;
+    lastDrawnGeometry = null; // Reset lastDrawnGeometry
+
+    // Vô hiệu hóa nút xuất
+    exportButton.setDisabled(true);
+
+    // Đặt lại map về vị trí trung tâm ban đầu
+    map.setCenter(105.8, 21.0, 6);
+};
+// <-- KẾT THÚC HÀM XÓA TẤT CẢ
+
+
+// BẮT ĐẦU HÀM XỬ LÝ SỰ KIỆN CLICK TRÊN MAP
+map.onClick(function(coords) {
+    // Kiểm tra xem có ảnh phân tích nào đang được hiển thị không
+    if (!lastAnalysisImage) {
+        pixelValueLabel.setValue('Không có ảnh phân tích để lấy giá trị.');
+        // ĐẢM BẢO XÓA MARKER CŨ DÙ KHÔNG CÓ ẢNH
+        var currentLayers = map.layers();
+        for (var i = 0; i < currentLayers.length(); i++) {
+            if (currentLayers.get(i).getName() === 'Clicked Point') {
+                map.remove(currentLayers.get(i));
+                break;
+            }
+        }
+        return;
+    }
+
+    // XÓA MARKER CŨ TRƯỚC KHI THÊM MARKER MỚI
+    var currentLayers = map.layers();
+    for (var i = 0; i < currentLayers.length(); i++) {
+        if (currentLayers.get(i).getName() === 'Clicked Point') {
+            map.remove(currentLayers.get(i));
+            break;
+        }
+    }
+
+    // Tạo một điểm hình học từ tọa độ click
+    var clickedPoint = ee.Geometry.Point(coords.lon, coords.lat);
+
+    // THÊM MARKER MÀU ĐỎ TẠI ĐIỂM CLICK
+    var clickMarker = ui.Map.Layer(clickedPoint, {color: 'FF0000'}, 'Clicked Point');
+    map.add(clickMarker);
+
+    // TỰ ĐỘNG XÁC ĐỊNH SCALE LẤY MẪU DỰA TRÊN VỆ TINH ĐÃ CHỌN
+    var satelliteType = satelliteSelect.getValue();
+    var samplingScale;
+
+    if (satelliteType === 'Sentinel-2') {
+        samplingScale = 10; // Sử dụng scale 10m cho Sentinel-2
+    } else if (satelliteType === 'Landsat 8' || satelliteType === 'Landsat 9') {
+        samplingScale = 30; // Sử dụng scale 30m cho Landsat
+    } else {
+        // Đối với các vệ tinh khác (như Sentinel-3), quay về scale mặc định của ảnh
+        samplingScale = lastAnalysisImage.projection().nominalScale();
+    }
+
+    // Thực hiện reduceRegion để lấy giá trị pixel tại điểm click
+    var pixelValueDict = lastAnalysisImage.reduceRegion({
+        reducer: ee.Reducer.first(), // Lấy giá trị của pixel đầu tiên (duy nhất) tại điểm
+        geometry: clickedPoint,
+        scale: samplingScale, // Sử dụng scale lấy mẫu đã xác định
+        bestEffort: true // Cho phép giảm scale nếu cần để tính toán
+    });
+
+    // Lấy giá trị từ Dictionary (bất đồng bộ)
+    pixelValueDict.evaluate(function(result) {
+        // Kiểm tra xem kết quả có hợp lệ và có chứa giá trị không
+        if (result && Object.keys(result).length > 0) {
+            // Lấy tên các băng tần để hiển thị thông tin chi tiết hơn
+            lastAnalysisImage.bandNames().evaluate(function(names) {
+                var displayString = 'Vĩ độ: ' + coords.lat.toFixed(4) + ', Kinh độ: ' + coords.lon.toFixed(4) + ' -> ';
+                var bandInfo = [];
+                // Lặp qua các kết quả trong dictionary (mỗi key là tên băng tần)
+                for (var bandName in result) {
+                    // Chỉ xử lý các thuộc tính riêng của đối tượng (không phải prototype)
+                    if (result.hasOwnProperty(bandName)) {
+                        var value = result[bandName];
+                        // Định dạng giá trị và thêm vào mảng thông tin băng tần
+                        bandInfo.push(bandName + ': ' + (value !== null ? value.toFixed(4) : 'N/A'));
+                    }
+                }
+                // Ghép các thông tin băng tần lại thành chuỗi, phân tách bằng dấu phẩy và khoảng trắng
+                displayString += bandInfo.join(', ');
+                // Cập nhật Label hiển thị giá trị pixel
+                pixelValueLabel.setValue(displayString);
+            });
+        } else {
+            // Nếu không có dữ liệu tại điểm đó (ví dụ: click vào vùng không có ảnh)
+            pixelValueLabel.setValue(
+                'Vĩ độ: ' + coords.lat.toFixed(4) + ', Kinh độ: ' + coords.lon.toFixed(4) + ' -> Không có dữ liệu tại điểm này.'
+            );
+        }
+    });
+});
+// <-- KẾT THÚC HÀM XỬ LÝ SỰ KIỆN CLICK TRÊN MAP
+
+
+// Gán hàm xử lý vào sự kiện click của nút
+processButton.onClick(runAnalysis);
+clearButton.onClick(clearAll); // Gán hàm clearAll cho nút Xóa Tất Cả
+exportButton.onClick(exportImage); // Gán hàm exportImage (xuất trực tiếp) cho nút Tải xuống
+
+
+// --- Kết thúc Script ---
